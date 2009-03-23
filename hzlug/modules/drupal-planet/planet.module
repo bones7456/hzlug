@@ -1,0 +1,1451 @@
+<?php
+// $Id: planet.install Exp $
+
+/**
+ * @file
+ * The planet module
+ * 
+ */
+
+function planet_node_info() {
+  return array(
+    'planet' => array(
+    'name' => t('Planet Entry'),
+    'module' => 'planet',
+    'description' => t('Node to contain posts aggregated from various blogs.'),
+    )
+  );
+}
+
+/**
+ * Implementation of hook_perm.
+ */
+function planet_perm() {
+  return array('administer planet', 'administer own planet feeds');
+}
+
+function planet_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help/planet':
+      $output = '<p>Planet is an aggregator that allows you to aggregate the blogs for users in a given role (e.g. staff) and associate content with the users rather than as a detached feed. This provides the benefit of showing avatars with content, providing per-user aggregation of planet content in addition to blog content, etc.</p>';
+      $output .= '<p>To use planet, go to admin/settings/planet and note the following sections:</p>';
+      $output .= '<ul>';
+      $output .= '<li><strong>General Settings</strong>. The role to select bloggers from lets you narrow the user list for when you\'re adding a feed and associating it with a user. A common setting will be to create a staff role and use this for planet.</li>';
+      $output .= '<li><strong>Feeds</strong>. This section lets you add a new feed. Give it a title, select an author, provide the feed url, and you\'re off. You\'ll have to manually refresh it or wait for a cron run for items to be imported.</li>';
+      $output .= '<li><strong>Feeds</strong>. This section lists current feeds, when they were last updated, how many items they have, and it allows you to edit, refresh, or freeze them. Freezing is a quick way to temporarily suspend updates from the given feed.</li>';
+      return $output;
+    case 'admin/modules#description':
+      return t('Aggregates RSS feeds and faciliates their association with site users who belong to a given role.');
+  }
+}
+
+function planet_view($node, $teaser = FALSE, $page = FALSE, $links = TRUE) {
+  if ($page === true && variable_get('planet_redirect_page', 0) == 1) {
+    $obj = db_fetch_object(db_query('SELECT * FROM {planet_items} WHERE nid = %d', $node->nid));
+    if ($obj->nid == $node->nid && $obj->link != '') {
+      header('Location: '. $obj->link);
+      exit;
+    }
+  }
+  else {
+    return node_prepare($node, $teaser);
+  }
+}
+
+function planet_access($op, $node, $account) {
+
+
+  if ($op == 'create') {
+    return user_access('edit own blog', $account) && $account->uid;
+  }
+
+  if ($op == 'update' || $op == 'delete') {
+    if (user_access('edit own blog', $account) && ($account->uid == $node->uid) || user_access('administer nodes', $account)) {
+      return TRUE;
+    }
+  }
+}
+
+function planet_menu() {
+  
+  $items['admin/settings/planet'] = array(
+    'title' => 'Planet Settings',
+    'description' => 'Configure settings for the planet module.',
+    'page callback' => '_planet_settings',
+    'access arguments' => array('administer nodes'),
+    'type' => MENU_NORMAL_ITEM);
+  
+  $items['user/%user/planet'] = array(
+    'title' => 'Planet Feeds',
+    'page callback' => 'planet_user_feeds',
+    'page arguments' => array(1),
+    'access arguments' => array('administer own planet feeds'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  
+  //  if (arg(0) == 'planet' && is_numeric(arg(1))) {
+  $items['planet/'. '%'] = array(
+    'title' => 'planet',
+    'page callback' => 'planet_page_user',
+    'page arguments' => array(arg(1))
+  );
+//  }
+
+//   if (arg(3) == 'refresh' && is_numeric(arg(4))) {
+  
+  $items['admin/settings/planet/refresh/%'] = array(
+    'title' => 'planet refresh',
+    'page callback' => 'planet_call_refresh',
+    'access arguments' => array('administer nodes'),
+    'type' => MENU_CALLBACK
+  );
+//   }
+
+//  if (is_numeric(arg(4)) && (arg(3) == 'freeze' || arg(3) == 'unfreeze')) {
+  $items['admin/settings/planet/'. arg(3) .'/%'] = array(
+    'title' => 'planet freeze',
+    'page callback' => 'planet_toggle_frozen',
+    'access arguments' => array('administer nodes'),
+    'type' => MENU_CALLBACK
+  );
+//   }
+
+  $items['planet'] = array(
+    'title' => 'Planet',
+    'description' => 'Planet Page',
+    'page callback' => 'planet_page_last',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM
+  );
+    
+  $items['planet/feed'] = array(
+    'title' => 'Planet',
+    'page callback' => 'planet_feed',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK
+  );  
+      
+  return $items;
+}
+
+function planet_call_refresh() {  
+  $title = planet_refresh();
+  watchdog('planet', 'Feed "'. $title .'" refreshed.');
+  drupal_set_message('Feed "'. $title .'" refreshed.');
+  drupal_goto('admin/settings/planet');
+}
+
+function planet_toggle_frozen() {
+  
+  $fid = intval(arg(4));
+  db_query('UPDATE {planet_feeds} SET frozen = %d WHERE fid = %d', arg(3) == 'unfreeze' ? 0 : 1, $fid);
+  drupal_set_message('Feed '. (arg(3) == 'unfreeze' ? 'un' : '') .'frozen.');
+  drupal_goto('admin/settings/planet');
+}
+
+
+function planet_user_feeds() {
+global $user;
+if ($_POST) {  
+    $edit = $_POST;
+    if ($_POST['op'] == 'Delete' && intval($edit['fid']) > 0) {
+      $result = db_query('SELECT nid FROM {planet_items} WHERE fid = %d', intval($edit['fid']));
+      while ($node = db_fetch_object($result)) {
+        $nodes[$node->nid] = TRUE;
+      }
+      return drupal_get_form('planet_multiple_delete_confirm', $nodes, intval($edit['fid']), 'user/'. $user->uid .'/planet');
+    }
+    else if ($_POST['op'] == 'Delete all' && $_POST['confirm'] == 1) {
+      $edit['fid'] = intval(arg(3));
+      $edit['redirect'] = 'user/'. $user->uid .'/planet';
+      return drupal_get_form('planet_multiple_delete_confirm_submit', $edit);
+    }
+    else {    
+      if (isset($edit['fid']) && intval($edit['fid']) == 0) {
+        db_query('INSERT INTO {planet_feeds} (uid, title, link, image, checked, frozen) VALUES(%d, "%s", "%s", "%s", 0, 0)', $user->uid, $edit['title'], $edit['link'], $edit['image']);
+	$edit_r = db_fetch_array(db_query('SELECT fid FROM {planet_feeds} WHERE uid = %d AND title = "%s" AND link = "%s"', $user->uid, $edit['title'], $edit['link']));
+	$title = planet_refresh(intval($edit_r['fid']));
+        drupal_set_message('Added new feed: ' . $title);    
+      }
+      else if ($edit['fid'] && intval($edit['fid']) > 0) {            
+        db_query('UPDATE {planet_feeds} SET uid = %d, title="%s", link = "%s", image="%s" WHERE fid=%d', $user->uid, $edit['title'], $edit['link'], $edit['image'], $edit['fid']);
+        drupal_set_message('Edited "'. $edit['title'] .'" feed.');      
+      }
+      else {
+        if ($edit['planet_author_roles']) {            
+          variable_set('planet_author_roles', $edit['planet_author_roles']);
+        }
+	if ($edit['planet_filter_formats']) {
+	  variable_set('planet_filter_formats', $edit['planet_filter_formats']);
+	}
+        if ($edit['planet_redirect_page'] == 1) {
+          variable_set('planet_redirect_page', $edit['planet_redirect_page']);
+        }
+        else {
+          variable_del('planet_redirect_page');
+        }
+        drupal_set_message('Edited general planet settings.');              
+      }      
+    }  
+    drupal_goto('user/'. $user->uid .'/planet');  
+  }
+  else {    
+    $fid = intval(arg(3));
+    if ($fid > 0) {      
+      $edit = db_fetch_array(db_query('SELECT * FROM {planet_feeds} WHERE fid = %d', $fid));
+      $output .= drupal_get_form('planet_feed_form', $edit, true, $user);
+    }
+    else {
+    
+      $output .= drupal_get_form('planet_feed_form', $edit, false, $user);
+    
+     // $result = db_query('SELECT *, (UNIX_TIMESTAMP(NOW()) - checked) _checked FROM {planet_feeds}');
+      $result = db_query('SELECT COUNT(f.fid) cnt, f.*, (UNIX_TIMESTAMP(NOW()) - checked) _checked FROM {planet_feeds} f LEFT OUTER JOIN {planet_items} i ON i.fid = f.fid WHERE f.uid = %d GROUP BY f.fid;', $user->uid);
+      $rows = array();
+      $headers = array('Feed', 'Items', 'Edit', 'Last checked');
+      while ($feed = db_fetch_object($result)) {
+        $checked = intval($feed->_checked / 60) .' minutes';
+        if ($feed->_checked % 60 > 0) {
+          $checked .= ', '. $feed->_checked % 60 .' seconds';
+        }
+        $checked .= ' ago';
+        array_push($rows, array(
+          $feed->title,
+          $feed->cnt,
+          l('edit', 'user/'. $user->uid .'/planet/'. intval($feed->fid)),
+          $checked,
+          )
+        );
+      }
+      $output .= '<h2>Feeds</h2>';
+      $output .= theme('table', $headers, $rows);      
+    }
+    print theme('page', $output);    
+  }
+}
+
+
+function _planet_settings() {
+  if ($_POST) {  
+    $edit = $_POST;
+    
+    if ($_POST['op'] == 'Delete' && intval($edit['fid']) > 0) {
+      $result = db_query('SELECT nid FROM {planet_items} WHERE fid = %d', intval($edit['fid']));
+      while ($node = db_fetch_object($result)) {
+        $nodes[$node->nid] = TRUE;
+      }
+      return drupal_get_form('planet_multiple_delete_confirm', $nodes, intval($edit['fid']), 'admin/settings/planet');
+    }
+    else if ($_POST['op'] == 'Delete all' && $_POST['confirm'] == 1) {
+      $edit['fid'] = intval(arg(3));
+      $edit['redirect'] = 'admin/settings/planet';
+      return drupal_get_form('planet_multiple_delete_confirm_submit', $edit);
+    }
+    else {    
+      if (isset($edit['fid']) && intval($edit['fid']) == 0) {
+        db_query('INSERT INTO {planet_feeds} (uid, title, link, image, checked, frozen) VALUES(%d, "%s", "%s", "%s", 0, 0)', $edit['uid'], $edit['title'], $edit['link'], $edit['image']);
+        drupal_set_message('Added new feed.');    
+      }
+      else if ($edit['fid'] && intval($edit['fid']) > 0) {            
+        db_query('UPDATE {planet_feeds} SET uid = %d, title="%s", link = "%s", image="%s" WHERE fid=%d', $edit['uid'], $edit['title'], $edit['link'], $edit['image'], $edit['fid']);
+        drupal_set_message('Edited "'. $edit['title'] .'" feed.');      
+      }
+      else {
+        if ($edit['planet_author_roles']) {            
+          variable_set('planet_author_roles', $edit['planet_author_roles']);
+        }
+	if ($edit['planet_filter_formats']) {
+	  variable_set('planet_filter_formats', $edit['planet_filter_formats']);
+	}
+        if ($edit['planet_redirect_page'] == 1) {
+          variable_set('planet_redirect_page', $edit['planet_redirect_page']);
+        }
+        else {
+          variable_del('planet_redirect_page');
+        }
+        drupal_set_message('Edited general planet settings.');              
+      }      
+    }  
+    drupal_goto('admin/settings/planet');  
+  }
+  else {    
+    $fid = intval(arg(3));
+    if ($fid > 0) {      
+      $edit = db_fetch_array(db_query('SELECT * FROM {planet_feeds} WHERE fid = %d', $fid));
+      $output .= drupal_get_form('planet_feed_form', $edit, true);
+    }
+    else {
+    
+      $output .= drupal_get_form('planet_settings_form');  
+      //$output .= drupal_get_form('settings', $form);
+      //$output .= $form;
+
+      $output .= drupal_get_form('planet_feed_form', $edit);
+    
+     // $result = db_query('SELECT *, (UNIX_TIMESTAMP(NOW()) - checked) _checked FROM {planet_feeds}');
+      $result = db_query('SELECT COUNT(f.fid) cnt, f.*, (UNIX_TIMESTAMP(NOW()) - checked) _checked FROM {planet_feeds} f LEFT OUTER JOIN {planet_items} i ON i.fid = f.fid GROUP BY f.fid;');
+      $rows = array();
+      $headers = array('Feed', 'Items', 'Edit', 'Last checked', 'Refresh', 'Freeze');
+      while ($feed = db_fetch_object($result)) {
+        $checked = intval($feed->_checked / 60) .' minutes';
+        if ($feed->_checked % 60 > 0) {
+          $checked .= ', '. $feed->_checked % 60 .' seconds';
+        }
+        $checked .= ' ago';
+        array_push($rows, array(
+          $feed->title,
+          $feed->cnt,
+          l('edit', 'admin/settings/planet/'. intval($feed->fid)),
+          $checked,
+          l('refresh', 'admin/settings/planet/refresh/'. intval($feed->fid)),
+          l($feed->frozen ? 'unfreeze' : 'freeze', 'admin/settings/planet/'. ($feed->frozen ? 'unfreeze/' : 'freeze/') . intval($feed->fid))          
+          )
+        );
+      }
+      $output .= '<h2>Feeds</h2>';
+      $output .= theme('table', $headers, $rows);      
+    }
+    print theme('page', $output);    
+  }
+}
+
+function planet_multiple_delete_confirm(&$form_state, $nodes, $fid, $redirect) {
+  $form_state['values']['fid'] = $fid;
+  $form_state['values']['redirect'] = $redirect;
+  $form['nodes'] = array('#prefix' => '<ul>', '#suffix' => '</ul>', '#tree' => TRUE);
+  // array_filter returns only elements with TRUE values
+  foreach ($nodes as $nid => $value) {
+    $title = db_result(db_query('SELECT title FROM {node} WHERE nid = %d', $nid));
+    $form['nodes'][$nid] = array(
+      '#type' => 'hidden',
+      '#value' => $nid,
+      '#prefix' => '<li>',
+      '#suffix' => check_plain($title) ."</li>\n",
+    );
+  }
+  $form['operation'] = array('#type' => 'hidden', '#value' => 'delete');
+  $form['#submit'][] = 'planet_multiple_delete_confirm_submit';
+  return confirm_form($form,
+                      t('Are you sure you want to delete these items?'),
+                      $redirect, t('This action cannot be undone.'),
+                      t('Delete all'), t('Cancel'));
+}
+
+function planet_multiple_delete_confirm_submit(&$form_state, $edit) {
+  $fid = $edit['fid'];
+  if ($edit['confirm']) {
+    foreach ($edit['nodes'] as $nid => $value) {
+      node_delete($nid);
+    }
+    db_query('DELETE FROM {planet_feeds} WHERE fid = %d', $fid);
+    db_query('DELETE FROM {planet_items} WHERE fid = %d', $fid);
+    drupal_set_message(t('The feed and items have been deleted.'));
+  }
+  drupal_goto($edit['redirect']);
+}
+
+
+
+function planet_settings_form(&$form_state) {
+  $roles = array();
+
+  $result = db_query('SELECT rid, name FROM {role}');
+  while ($role = db_fetch_object($result)) {
+    $roles[$role->rid] = $role->name;
+  }
+  
+  unset($result);
+  $result = db_query('SELECT format, name FROM {filter_formats}');
+  while ($format = db_fetch_object($result)) {
+    $formats[$format->format] = $format->name;
+  }
+
+  $form = array();
+  
+  $form['general'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('General Settings')
+  );
+  
+  $form['general']['planet_author_roles'] = array(
+    '#type' => 'select',
+    '#title' => t('Role to select authors from'),
+    '#options' => $roles,
+    '#default_value' => variable_get('planet_author_roles', 2),
+    '#description' => t('Select the role from which blog authors should be selected on the feed creation screen.')
+  );
+  
+  $form['general']['planet_filter_formats'] = array(
+    '#type' => 'select',
+    '#title' => t('Filter format for planet entry nodes'),
+    '#options' => $formats,
+    '#default_value' => variable_get('planet_filter_formats', 1),
+    '#description' => t('Select the filter format that will be used to show planet entry nodes.')
+  );
+  
+  $form['general']['planet_redirect_page'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Redirect node?'),
+    '#return_value' => 1,
+    '#value' => (variable_get('planet_redirect_page', 0) == 1) ? 1 : null,
+    '#description' => t('Check this if you want the node view to redirect to the original content link; this is useful if you want the feed to forward through instead of showing the planet node.')
+  );
+  
+  $form['general']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => 'Save Configuration'
+  );
+  
+  return $form;
+}
+    
+
+function planet_feed_form(&$form_state, $edit = array(), $individual = false, $user = NULL) {
+  $uids = array();
+  $result = db_query('SELECT u.uid, u.name FROM {users} u, {role} r, {users_roles} ur WHERE u.uid = ur.uid AND ur.rid = r.rid AND r.rid = %d ORDER BY u.name ASC', variable_get('planet_author_roles', 2));
+  while ($f_user = db_fetch_object($result)) {
+    $uids[$f_user->uid] = $f_user->name;
+  }    
+  
+  if ($individual) {
+    if (!isset($uids[$edit['uid']])) {
+      $g_user = db_fetch_array(db_query('SELECT uid, name FROM {users} WHERE uid = %d', $edit['uid']));
+      $uids[$edit['uid']] = $g_user['name'];
+    }
+  }
+  
+  $form = array();
+
+  $form['feeds'] = array(
+    '#type' => 'fieldset',
+    '#title' => 'Feeds'
+  );  
+
+  $form['feeds']['fid'] = array(
+    '#type' => 'hidden',
+    '#value' => $edit['fid']
+  );
+
+  $form['feeds']['title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Title'),
+    '#value' => $edit['title'],
+    '#size' => 40,
+    '#maxlength' => 40
+  );
+
+  if ($user == NULL) {
+    $form['feeds']['uid'] = array(
+      '#type' => 'select',
+      '#title' => t('Original author'),    
+      '#value' => $edit['uid'],
+      '#options' => $uids,
+      '#description' => t('Select a user to associate this feed with')
+    );
+  }
+  else {
+    $form['feeds']['uid'] = array(
+      '#type' => 'hidden',
+      '#value' => $user->uid,
+    );
+  }
+  $form['feeds']['link'] = array(
+    '#type' => 'textfield',
+    '#title' => t('URL'),
+    '#value' => $edit['link'],
+    '#size' => 40,
+    '#maxlength' => 80
+  );
+
+  $form['feeds']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => $edit['fid'] > 0 ? 'Save' : 'Add'.' Feed'
+  );
+
+  if ($individual) {
+    $form['feeds']['delete'] = array(
+      '#type' => 'submit',
+      '#value' => 'Delete',
+    );
+  }
+
+  return $form;
+}
+
+function planet_cron() {
+  $result = db_query('SELECT fid FROM {planet_feeds} WHERE frozen = 0');
+  while ($feed = db_fetch_object($result)) {
+    $title = planet_refresh($feed->fid);
+    watchdog('planet', 'Cron updated feed "'. $title .'".');
+  }
+}
+
+function planet_refresh($fid = null) {
+  if (!$fid) {
+    $fid = intval(arg(4));
+  }
+  
+  $feed = db_fetch_object(db_query('SELECT * FROM {planet_feeds} WHERE fid = %d', $fid));
+  
+  $headers = array();
+  $result = planet_http_request($feed->link, $headers, 15);  
+  
+  switch ($result->code) {
+    case 304:
+      drupal_set_message(t('No new content syndicated from %site.', array('%site' => '<em>'. $feed->title .'</em>')));
+      break;
+
+    case 301:
+      if ($result->redirect_url) {
+        $feed->link = $result->redirect_url;
+        watchdog('planet', 'Updated URL for feed %title to %url.', array('%title' => '<em>'. $feed->title .'</em>', '%url' => '<em>'. $feed->url .'</em>'), WATCHDOG_NOTICE, l(t('view'), 'planet/'.$feed->fid));
+        db_query("UPDATE {planet_feeds} SET link = '%s' WHERE fid = %d", $feed->link, $feed->fid);
+      }
+      break;
+
+    case 200:
+    case 302:
+    case 307:
+      $xml_tree = planet_parse_xml($result->data);
+
+      if ($xml_tree['parser_error']) {
+        watchdog('planet', 'Failed to parse RSS feed %site: %error at line %line.', array('%site' => '<em>'. $feed->title .'</em>', '%error' => $xml_tree['parser_error'], '%line' => $xml_tree['parser_line']), WATCHDOG_ERROR);
+        drupal_set_message(t('Failed to parse RSS feed %site: %error at line %line.', array('%site' => '<em>'. $feed->title .'</em>', '%error' => $xml_tree['parser_error'], '%line' => $xml_tree['parser_line'])), 'error');
+        break;
+      }
+      else {
+        drupal_set_message('Parsing feed '. $feed->title .' took '. $xml_tree['parser_time'] .' seconds.');
+      }
+
+      if (planet_parse_items($xml_tree, $feed) !== false) {
+        if ($result->headers['Last-Modified']) {
+          $modified = strtotime($result->headers['Last-Modified']);
+        }
+
+        /*
+        ** Prepare data:
+        */
+        if ($xml_tree['RSS']) { // RSS 0.91, 0.92, 2.0
+          $root = &$xml_tree['RSS'][0];
+          $channel = &$root['CHANNEL'][0];
+          $image = &$channel['IMAGE'][0];
+          $description = &$channel['DESCRIPTION'][0]['VALUE'];
+          $link = &$channel['LINK'][0]['VALUE'];
+        }
+        else if ($xml_tree['RDF:RDF']) {
+          $root = &$xml_tree['RDF:RDF'][0];
+          $channel = &$root['CHANNEL'][0];
+          $image = &$root['IMAGE'][0];
+          $description = &$channel['DESCRIPTION'][0]['VALUE'];
+          $link = &$channel['LINK'][0]['VALUE'];
+        }
+        else if ($xml_tree['FEED']) { // Atom 0.3, 1.0
+          $root = &$xml_tree['FEED'][0];
+          $channel = &$root;
+          $image = &$channel['LOGO'][0]['VALUE'];
+          $description = ($channel['TAGLINE'][0]['VALUE'] ? $channel['TAGLINE'][0]['VALUE'] : '');
+          // TODO: remove this Atom hack when we have field mapping or at least specialized parsers in place
+          if (count($channel['LINK']) > 1) {
+            $link = $feed->link;
+            foreach ($channel['LINK'] as $l) {
+              if ($l['REL'] == 'alternate') {
+                $link = $l['HREF'];
+              }
+            }
+          }
+          else {
+            $link = $channel['LINK'][0]['HREF'];
+          }
+        }
+        else if ($xml_tree['CHANNEL']) { // RSS 1.1
+          $root = &$xml_tree['CHANNEL'][0];
+          $channel = &$root;
+          $image = &$channel['IMAGE'][0];
+          $description = &$channel['DESCRIPTION'][0]['VALUE'];
+          $link = &$channel['LINK'][0]['VALUE'];
+        }
+        else if ($xml_tree['OPML']) {
+          $root = &$xml_tree['OPML'][0];
+          $channel = &$root;
+          $image = NULL;
+          $description = NULL;
+          $link = NULL;
+        }
+        else {
+          // unsupported format
+          break;
+        }
+
+        if (!$feed->uid) {
+          if ($channel['AUTHOR'][0]['VALUE']) {
+            $feed->uid = $channel['AUTHOR'][0]['VALUE'];
+          }
+          if ($channel['AUTHOR'][0]['NAME'][0]['VALUE']) {
+            $feed->uid = $channel['AUTHOR'][0]['NAME'][0]['VALUE'];
+          }
+          else if ($channel['DC:CREATOR']) {
+            $feed->uid = $channel['DC:CREATOR'][0]['VALUE'];
+          }
+          else {
+            $feed->uid = '';
+          }
+        }
+
+        /*
+        ** Generate image link
+        */
+        if (!$feed->image && $image['LINK'] && $image['URL'] && $image['TITLE']) {
+          if (strlen($image['TITLE'][0]['VALUE']) > 250) {
+            $image['TITLE'][0]['VALUE'] = trim(substr($image['TITLE'][0]['VALUE'], 0, 250)).'...';
+          }
+          $feed->image = '<a href="'. $image['LINK'][0]['VALUE'] .'" class="planet_logo_link"><img src="'. $image['URL'][0]['VALUE'] .'" class="planet_logo" alt="'. $image['TITLE'][0]['VALUE'] .'" /></a>';
+        }
+
+        /*
+        ** Update the feed data:
+        */
+        $feed->checked = time();
+        $feed->link = $link;
+        $feed->etag = $result->headers['ETag'];
+        $feed->modified = $modified;
+        if ($feed->body == '' && $description/* && valid_input_data($description)*/) {
+          $feed->body = $feed->teaser = $description;
+        }
+        $feed->rss_data = &$xml_tree;
+
+        /*
+        ** Taxonomy module doesn't add taxonomy terms at load time... so we have to do it by hand :((
+        */
+        $terms = module_invoke('taxonomy', 'node_get_terms', $feed->nid, 'tid');
+        $feed->taxonomy = array();
+        foreach ($terms as $tid => $term) {
+          if ($term->tid) {
+            $feed->taxonomy[] = $term->tid;
+          }
+        }
+      }
+    default:      
+  }  
+  
+  
+  db_query('UPDATE {planet_feeds} SET checked = %d WHERE fid = %d', time(), $fid);
+  return $feed->title;    
+  //print theme('page', 'refreshing '. $fid .'.');// and got '. print_r($feed, 1));
+}
+
+/**
+ * Private function; Parse HTTP headers from data retreived with cURL
+ * from: http://pl2.php.net/manual/en/function.curl-setopt.php#42009
+ */
+function planet_parse_response($response) {
+  /*
+   ***original code extracted from examples at
+   ***http://www.webreference.com/programming
+                           /php/cookbook/chap11/1/3.html
+
+   ***returns an array in the following format which varies depending on headers returned
+
+       [0] => the HTTP error or response code such as 404
+       [1] => Array
+       (
+           [Server] => Microsoft-IIS/5.0
+           [Date] => Wed, 28 Apr 2004 23:29:20 GMT
+           [X-Powered-By] => ASP.NET
+           [Connection] => close
+           [Set-Cookie] => COOKIESTUFF
+           [Expires] => Thu, 01 Dec 1994 16:00:00 GMT
+           [Content-Type] => text/html
+           [Content-Length] => 4040
+       )
+       [2] => Response body (string)
+  */
+
+  do {
+    list($response_headers, $response) = explode("\r\n\r\n", $response, 2);
+    $response_header_lines = explode("\r\n", $response_headers);
+
+    // first line of headers is the HTTP response code
+    $http_response_line = array_shift($response_header_lines);
+    if (preg_match('@^HTTP/[0-9]\.[0-9] ([0-9]{3})@', $http_response_line, $matches)) {
+      $response_code = $matches[1];
+    }
+    else {
+      $response_code = "Error";
+    }
+  }
+  while (substr($response_code, 0, 1) == "1");
+
+  $response_body = $response;
+        
+  // put the rest of the headers in an array
+  $response_header_array = array();
+  foreach ($response_header_lines as $header_line) {
+    list($header, $value) = explode(':', $header_line, 2);
+    $response_header_array[$header] = trim($value);
+  }
+
+  return array($response_code, $response_header_array, $response_body, $http_response_line);
+}
+
+/**
+ * Private function; Gets data from given URL :)
+ */
+function planet_http_request($url, $headers = array(), $timeout = 15, $method = 'GET', $data = NULL, $follow = 3) {
+  if (!function_exists('curl_init')) {
+    return drupal_http_request($url, $headers, $method, $data, $follow);
+  }
+
+  // convert headers array to format used by cURL
+  $temp = array();
+  foreach ($headers as $header => $value) {
+    $temp[] = $header .': '. $value;
+  }
+  $headers = $temp;
+
+  $result = new StdClass();
+
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_HEADER, 1);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+  curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 0);
+  curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+
+  $data = curl_exec($ch);
+  $info = curl_getinfo($ch);
+
+  curl_close($ch);
+  unset($ch);
+
+  $response = planet_parse_response($data);
+  $result->code = $response[0];
+  $result->headers = $response[1];
+  $result->data = $response[2];
+  $error = $response[3];
+  switch ($code) {
+    case 200: // OK
+    case 304: // Not modified
+      break;
+    case 301: // Moved permanently
+    case 302: // Moved temporarily
+    case 307: // Moved temporarily
+      $location = $result->headers['Location'];
+
+      if ($follow) {
+        $result = planet_http_request($result->headers['Location'], $headers, $timeout, $method, $data, --$follow);
+        $result->redirect_code = $result->code;
+      }
+      $result->redirect_url = $location;
+      break;
+    default:
+      $result->error = $error;
+      break;
+  }
+
+  $result->code = $response[0];
+  return $result;
+}
+
+/**
+ * Private function; Checks a news feed for new items.
+ */
+
+
+/**
+ * Private function;
+ * Parse the W3C date/time format, a subset of ISO 8601. PHP date parsing
+ * functions do not handle this format.
+ * See http://www.w3.org/TR/NOTE-datetime for more information.
+ * Origionally from MagpieRSS (http://magpierss.sourceforge.net/).
+ *
+ * @param $date_str A string with a potentially W3C DTF date.
+ * @return A timestamp if parsed successfully or -1 if not.
+ */
+function planet_parse_w3cdtf($date_str) {
+  if (preg_match('/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(:(\d{2}))?(?:([-+])(\d{2}):?(\d{2})|(Z))?/', $date_str, $match)) {
+    list($year, $month, $day, $hours, $minutes, $seconds) = array($match[1], $match[2], $match[3], $match[4], $match[5], $match[6]);
+    // calc epoch for current date assuming GMT
+    $epoch = gmmktime($hours, $minutes, $seconds, $month, $day, $year);
+    if ($match[10] != 'Z') { // Z is zulu time, aka GMT
+      list($tz_mod, $tz_hour, $tz_min) = array($match[8], $match[9], $match[10]);
+      // zero out the variables
+      if (!$tz_hour) {
+        $tz_hour = 0;
+      }
+      if (!$tz_min) {
+        $tz_min = 0;
+      }
+      $offset_secs = (($tz_hour * 60) + $tz_min) * 60;
+      // is timezone ahead of GMT?  then subtract offset
+      if ($tz_mod == '+') {
+        $offset_secs *= -1;
+      }
+      $epoch += $offset_secs;
+    }
+    return $epoch;
+  }
+  else {
+    return -1;
+  }
+}
+
+/**
+ * Private function;
+ * from: http://pl2.php.net/manual/en/function.html-entity-decode.php#51055
+ * Used as callback function for preg_replace_all() to decode numeric entities to UTF-8 chars
+ *
+ * @param $ord Number
+ * @return UTF-8 string
+ */
+function planet_replace_num_entity($ord) {
+  $ord = $ord[1];
+  if (preg_match('/^x([0-9a-f]+)$/i', $ord, $match)) {
+    $ord = hexdec($match[1]);
+  }
+  else {
+    $ord = intval($ord);
+  }
+
+  $no_bytes = 0;
+  $byte = array();
+
+  if ($ord == 128) {
+    return chr(226) . chr(130) . chr(172);
+  }
+  else if ($ord == 129) {
+    return chr(239) . chr(191) . chr(189);
+  }
+  else if ($ord == 130) {
+    return chr(226) . chr(128) . chr(154);
+  }
+  else if ($ord == 131) {
+    return chr(198) . chr(146);
+  }
+  else if ($ord == 132) {
+    return chr(226) . chr(128) . chr(158);
+  }
+  else if ($ord == 133) {
+    return chr(226) . chr(128) . chr(166);
+  }
+  else if ($ord == 134) {
+    return chr(226) . chr(128) . chr(160);
+  }
+  else if ($ord == 135) {
+    return chr(226) . chr(128) . chr(161);
+  }
+  else if ($ord == 136) {
+    return chr(203) . chr(134);
+  }
+  else if ($ord == 137) {
+    return chr(226) . chr(128) . chr(176);
+  }
+  else if ($ord == 138) {
+    return chr(197) . chr(160);
+  }
+  else if ($ord == 139) {
+    return chr(226) . chr(128) . chr(185);
+  }
+  else if ($ord == 140) {
+    return chr(197) . chr(146);
+  }
+  else if ($ord == 141) {
+    return chr(239) . chr(191) . chr(189);
+  }
+  else if ($ord == 142) {
+    return chr(197) . chr(189);
+  }
+  else if ($ord == 143) {
+    return chr(239) . chr(191) . chr(189);
+  }
+  else if ($ord == 144) {
+    return chr(239) . chr(191) . chr(189);
+  }
+  else if ($ord == 145) {
+    return chr(226) . chr(128) . chr(152);
+  }
+  else if ($ord == 146) {
+    return chr(226) . chr(128) . chr(153);
+  }
+  else if ($ord == 147) {
+    return chr(226) . chr(128) . chr(156);
+  }
+  else if ($ord == 148) {
+    return chr(226) . chr(128) . chr(157);
+  }
+  else if ($ord == 149) {
+    return chr(226) . chr(128) . chr(162);
+  }
+  else if ($ord == 150) {
+    return chr(226) . chr(128) . chr(147);
+  }
+  else if ($ord == 151) {
+    return chr(226) . chr(128) . chr(148);
+  }
+  else if ($ord == 152) {
+    return chr(203) . chr(156);
+  }
+  else if ($ord == 153) {
+    return chr(226) . chr(132) . chr(162);
+  }
+  else if ($ord == 154) {
+    return chr(197) . chr(161);
+  }
+  else if ($ord == 155) {
+    return chr(226) . chr(128) . chr(186);
+  }
+  else if ($ord == 156) {
+    return chr(197) . chr(147);
+  }
+  else if ($ord == 157) {
+    return chr(239) . chr(191) . chr(189);
+  }
+  else if ($ord == 158) {
+    return chr(197) . chr(190);
+  }
+  else if ($ord == 159) {
+    return chr(197) . chr(184);
+  }
+  else if ($ord == 160) {
+    return chr(194) . chr(160);
+  }
+
+  if ($ord < 128) {
+    return chr($ord);
+  }
+  else if ($ord < 2048) {
+    $no_bytes = 2;
+  }
+  else if ($ord < 65536) {
+    $no_bytes = 3;
+  }
+  else if ($ord < 1114112) {
+    $no_bytes = 4;
+  }
+  else {
+    return;
+  }
+
+  switch ($no_bytes) {
+    case 2:
+      $prefix = array(31, 192);
+      break;
+
+    case 3:
+      $prefix = array(15, 224);
+      break;
+
+    case 4:
+      $prefix = array(7, 240);
+      break;
+  }
+
+  for ($i = 0; $i < $no_bytes; $i++) {
+    $byte[$no_bytes - $i - 1] = (($ord & (63 * pow(2, 6 * $i))) / pow(2, 6 * $i)) & 63 | 128;
+  }
+
+  $byte[0] = ($byte[0] & $prefix[0]) | $prefix[1];
+
+  $ret = '';
+  for ($i = 0; $i < $no_bytes; $i++) {
+    $ret .= chr($byte[$i]);
+  }
+
+  return $ret;
+}
+
+/**
+ * Private function; Convert named entities to UTF-8 characters
+ * from: http://pl2.php.net/manual/en/function.html-entity-decode.php#51722
+ */
+function planet_replace_name_entities(&$text) {
+  static $ttr;
+  if (!$ttr) {
+    $trans_tbl = get_html_translation_table(HTML_ENTITIES);
+    foreach ($trans_tbl as $k => $v) {
+      $ttr[$v] = utf8_encode($k);
+    }
+    $ttr['&apos;'] = "'";
+  }
+  return strtr($text, $ttr);
+}
+
+/**
+ * Private function; Convert all entities to UTF-8 characters
+ */
+function planet_replace_entities(&$text) {
+  $result = planet_replace_name_entities($text);
+  return preg_replace_callback('/&#([0-9a-fx]+);/mi', 'planet_replace_num_entity', $result);
+}
+
+/**
+ * Private function; Clone object function to stay compatible with both php4 and php5
+ * from: Drupal 4.7CVS
+ * TODO: remove after moving to Drupal 4.7
+ */
+function planet_clone($object) {
+  return version_compare(phpversion(), '5.0') < 0 ? $object : clone($object);
+}
+
+/**
+ * Private function; Convert relative URLs
+ */
+function planet_convert_relative_urls(&$data, $base_url) {
+  $src = '%( href| src)="(?!\w+://)/?([^"]*)"%';
+  $dst = '$1="'. trim($base_url, '/') .'/$2"';
+  return preg_replace($src, $dst, $data);
+}
+
+/**
+ * Private function; Creates nodes from data found in given xml_tree
+ */
+function planet_parse_items(&$xml_tree, &$feed) {
+
+  if ($xml_tree['RSS']) { // RSS 0.91, 0.92, 2.0
+    $items = &$xml_tree['RSS'][0]['CHANNEL'][0]['ITEM'];
+    $link_field = 'VALUE';
+  }
+  else if ($xml_tree['RDF:RDF']) {
+    $items = &$xml_tree['RDF:RDF'][0]['ITEM'];
+    $link_field = 'VALUE';
+  }
+  else if ($xml_tree['FEED']) { // Atom 0.3, 1.0
+    $items = &$xml_tree['FEED'][0]['ENTRY'];
+    $link_field = 'HREF';
+  }
+  else if ($xml_tree['CHANNEL']) { // RSS 1.1
+    $items = &$xml_tree['CHANNEL'][0]['ITEMS'][0]['ITEM'];
+    $link_field = 'VALUE';
+  }
+  else {
+    // unsupported format
+    $items = array();
+    return false;
+  }
+
+  /*
+  ** We reverse the array such that we store the first item last,
+  ** and the last item first. In the database, the newest item
+  ** should be at the top.
+  */
+  $items_added = 0;      
+
+
+  for ($index = count($items) - 1; $index >= 0; $index--) {
+    $item = &$items[$index];
+  //print '<pre>'. print_r($item, 1) .'</pre>';
+    $teaser = NULL;
+    $body = NULL;
+
+    // Description field is needed early for case when no title is specified
+    if ($item['DESCRIPTION']) { // RSS 0.91, 0.92, 1.0, 1.1, 2.0
+      $body = &$item['DESCRIPTION'][0]['VALUE'];
+    }
+    else if ($item['SUMMARY']) { // Atom 0.3, 1.0
+      $body = &$item['SUMMARY'][0]['VALUE'];
+    }
+    
+    if ($item['CONTENT']) { // Atom 0.3, 1.0
+      if (strlen($body) < strlen($item['CONTENT'][0]['VALUE'])) {
+        if ($body) {
+          $teaser = $body;
+        }
+        $body = &$item['CONTENT'][0]['VALUE'];
+      }
+    }
+    else if ($item['CONTENT:ENCODED']) { // Don't know where it came from but it can be found in RSS 2.0 feeds
+      if (strlen($body) < strlen($item['CONTENT:ENCODED'][0]['VALUE'])) {
+        if ($body) {
+          $teaser = $body;
+        }
+        $body = &$item['CONTENT:ENCODED'][0]['VALUE'];
+      }
+    }
+    
+    /*
+    ** Resolve the item's title. If no title is found, we use
+    ** up to 40 characters of the description ending at a word
+    ** boundary but not splitting potential entities.
+    */
+    if (!($title = $item['TITLE'][0]['VALUE'])) {
+      $title = preg_replace('/^(.*)[^\w;&].*?$/', "\\1", truncate_utf8($body, 40));
+    }
+
+    // If title was "escaped" then it may still contain entities, becuase each & from entity was also escabet to &amp; before
+    // TODO: the same for content?
+    if ($item['TITLE'][0]['MODE'] == 'escaped') {
+      $title = planet_replace_entities($title);
+    }
+    $title = strip_tags($title);
+
+    /*
+    ** Resolve the items link.
+    */
+    if ($item['LINK']) {
+      // TODO: remove this Atom hack when we have field mapping or at least specialized parsers in place
+      if (count($item['LINK']) > 1) {
+        $link = $feed->link;
+        foreach ($item['LINK'] as $temp) {
+          if ($temp['REL'] == 'alternate') {
+            $link = $temp[$link_field];
+          }
+        }
+      }
+      else {
+        $link = $item['LINK'][0][$link_field];
+      }
+    }
+    elseif ($item['GUID'] && (strncmp($item['GUID'][0][$link_field], 'http://', 7) == 0) && $item['GUID'][0]['ISPERMALINK'] != 'false') {
+      $link = $item['GUID'][0][$link_field];
+    }
+    else {
+      $link = $feed->link;
+    }
+
+    /*
+    ** Resolve the items source.
+    */
+    if ($item['SOURCE'][0]['VALUE'] && $item['SOURCE'][0]['URL']) { // RSS 2.0
+      $source_title = &$item['SOURCE'][0]['VALUE'];
+      $source_link = &$item['SOURCE'][0]['URL'];
+    }
+    else if ($item['SOURCE'] || $item['ATOM:SOURCE']) { // ATOM 1.0
+      if ($item['SOURCE'][0]['TITLE']) $source_title = &$item['SOURCE'][0]['TITLE'][0]['VALUE'];
+      else if ($item['SOURCE'][0]['ATOM:TITLE']) $source_title = &$item['SOURCE'][0]['ATOM:TITLE'][0]['VALUE'];
+      if ($item['SOURCE'][0]['LINK']) $source_link = &$item['SOURCE'][0]['LINK'][0]['VALUE'];
+      else if ($item['SOURCE'][0]['ATOM:LINK']) $source_link = &$item['SOURCE'][0]['ATOM:LINK'][0]['VALUE'];
+    }
+    else {
+      $source_title = '';
+      $source_link = '';
+    }
+
+    /*
+    ** Try to resolve and parse the item's publication date.  If no
+    ** date is found, we use the current date instead.
+    */
+    // TODO: find nicer way for handling namespaces ;)
+    if ($item['PUBDATE']) $date = $item['PUBDATE'][0]['VALUE'];                        // RSS 2.0
+    else if ($item['DC:DATE']) $date = $item['DC:DATE'][0]['VALUE'];                   // Dublin core
+    else if ($item['DATE']) $date = $item['DATE'][0]['VALUE'];                         // Dublin core
+    else if ($item['DCTERMS:ISSUED']) $date = $item['DCTERMS:ISSUED'][0]['VALUE'];     // Dublin core
+    else if ($item['ISSUED']) $date = $item['ISSUED'][0]['VALUE'];                     // Dublin core
+    else if ($item['DCTERMS:CREATED']) $date = $item['DCTERMS:CREATED'][0]['VALUE'];   // Dublin core
+    else if ($item['CREATED']) $date = $item['CREATED'][0]['VALUE'];                   // Dublin core
+    else if ($item['DCTERMS:MODIFIED']) $date = $item['DCTERMS:MODIFIED'][0]['VALUE']; // Dublin core
+    else if ($item['MODIFIED']) $date = $item['MODIFIED'][0]['VALUE'];                 // Dublin core
+    else if ($item['ATOM:UPDATED']) $date = $item['ATOM:UPDATED'][0]['VALUE'];         // Atom
+    else if ($item['UPDATED']) $date = $item['UPDATED'][0]['VALUE'];                   // Atom
+    else $date = 'now';
+
+    if ($feed->item_date_source == FEEDS_ITEM_DATE_SNIFFED && $date) {
+      $timestamp = strtotime($date); // strtotime() returns -1 on failure
+      if ($timestamp < 0) {
+        $timestamp = planet_parse_w3cdtf($date); // also returns -1 on failure
+        if ($timestamp < 0) {
+          $timestamp = time(); // better than nothing
+        }
+      }
+    }
+    else {
+      $timestamp = time();
+    }
+
+    // Ignore items older than allowed for feed
+    if ($timestamp < $time_horizont) {
+      continue;
+    }
+
+    /*
+    ** Save this item. Try to avoid duplicate entries as much as
+    ** possible. If we find a duplicate entry, we resolve it and
+    ** pass along it's ID such that we can update it if needed.
+    */
+    // Try to use RSS:GUID/ATOM:ID as unique identifier
+    $guid = '';
+    if ($item['GUID'][0]['VALUE']) { // RSS 2.0
+      $guid = $item['GUID'][0]['VALUE'];
+    }
+    else if ($item['ATOM:ID'][0]['VALUE']) { // ATOM 0.3, 1.0
+      $guid = $item['ATOM:ID'][0]['VALUE'];
+    }
+    else if ($item['ID'][0]['VALUE']) { // ATOM 0.3, 1.0
+      $guid = $item['ID'][0]['VALUE'];
+    }
+    else {
+      // feed may contain duplicated links for different items, so we try to generate unique ID for each item
+      $guid = md5("$title - . " . $feed->fid);
+    }
+    // TODO: is there anyway to check if DC:IDENTIFIER is unique?
+    //       http://dublincore.org/documents/usageguide/elements.shtml says it can be non-unique so useles for us :(      
+
+    $entry = NULL;
+    if ($guid && strlen($guid) > 0) {
+      $entry = db_fetch_object(db_query("SELECT nid FROM {planet_items} WHERE guid = '%s' AND fid = %d", $guid, $feed->fid));
+    }
+    else if ($link && $link != $feed->link && $link != $feed->url) {
+      $entry = db_fetch_object(db_query("SELECT nid FROM {planet_items} WHERE guid = '%s' AND fid = %d", $link, $feed->fid));
+    }
+    else {
+      $entry = db_fetch_object(db_query("SELECT ai.nid AS nid FROM {node} n, {planet_items} ai WHERE ai.fid = %d AND ai.nid = n.nid AND n.title = '%s'", $feed->fid, $title));
+    }
+
+    //print $guid .'<br />';
+    //print $entry->nid .'<br />';
+    // Ignore items already existing in database and not allowed to be updated
+
+    //Fields to update in either case
+    $entry->changed = strtotime($date);
+    $entry->title = $title;
+    $entry->body = $body;
+    $entry->body = planet_convert_relative_urls($body, $link);
+    $entry->teaser = node_teaser($entry->body);    
+    $entry->revision = true;
+
+    //Fields to set if it's a new item.    
+    if (!isset($entry->nid)) {            
+      //print "Planet item " . $entry->title . "<br />";
+      $entry->type = 'planet';
+ 
+      $options = variable_get('node_options_planet', array());
+
+      $entry->uid = $feed->uid;
+      $entry->status = 1;
+      $entry->moderate = 0;
+      $entry->promote = in_array('promote', $options) ? 1 : 0;
+      $entry->sticky = in_array('sticky', $options) ? 1 : 0;
+      $entry->comment = in_array('comment', $options) ? 2 : 0;
+      $entry->format = variable_get('planet_filter_formats', 1);
+      $entry->created = strtotime($date);
+      $entry->revision = true;
+      
+      $terms = module_invoke('taxonomy', 'node_get_terms', $edit->nid, 'tid');
+      foreach ($terms as $tid => $term) {
+        if ($term->tid) {
+          $edit->taxonomy[] = $term->tid;
+        }
+      }
+      //print '<pre>'. print_r($entry, 1) .'</pre>';
+      node_save($entry);
+      db_query('INSERT INTO {planet_items} (fid, nid, guid, link, created) VALUES(%d, %d, "%s", "%s", UNIX_TIMESTAMP(NOW()))', $feed->fid, $entry->nid, $guid, $link);              
+      watchdog('planet', 'Adding '. $title);
+      drupal_set_message('Adding '. $title);
+    }  
+  }
+
+  return $items_added;
+}
+
+
+/**
+ * Private function; parses given XML data and returns array
+ */
+function planet_parse_xml(&$data) {
+  global $xml_tree, $xml_paths, $xml_path_cur;
+  $xml_tree = array();
+  $xml_paths[] = &$xml_tree;
+  $xml_path_cur = 0;
+
+  $_start = microtime();
+
+  // Some feeds already use CDATA but in "wrong way": http://www.rocketboom.com/vlog/quicktime_daily_enclosures.xml (ie. <description> something <CDATA soemthing else></description>
+  $data = trim(str_replace(array('<![CDATA[', ']]>'), '', $data));
+  
+  // Add CDATA around content which may contain (x)html data, and is not contained in CDATA yet
+  $src = array(
+    '%(<(link|content|content:encoded|description|title|summary|info|tagline|copyright|source|itunes:summary|media:text|text)(?>[^<]*(?<!/)>)(?!<!\[CDATA\[))(.*)(</\2>)%sUS',
+    '%24:(\d\d:\d\d)%' // workaround buggy hour format in feeds
+    /*'%(<(\w+)(?>[^<]*type=")(?:text/html|application/xhtml\+xml|html|xhtml")(?>[^<]*(?<!/)>)(?!<!\[CDATA\[))(.*)(</\2>)%sUS'*/
+    );
+  $dst = array(
+    '$1<![CDATA[$3]]>$4',
+    '00:$1'
+    );
+  $data = preg_replace($src, $dst, $data);
+
+  // parse the data:
+  $xml_parser = drupal_xml_parser_create($data);
+  if ($xml_parser == NULL) {
+    return $xml_tree;
+  }
+
+  xml_set_element_handler($xml_parser, 'planet_element_start', 'planet_element_end');
+  xml_set_character_data_handler($xml_parser, 'planet_element_data');
+  xml_parser_set_option($xml_parser, XML_OPTION_CASE_FOLDING, 1);
+  xml_parser_set_option($xml_parser, XML_OPTION_SKIP_WHITE, 1);
+  if (!xml_parse($xml_parser, $data, 1)) {
+    $xml_tree['parser_error'] = xml_error_string(xml_get_error_code($xml_parser));
+    $xml_tree['parser_line'] = xml_get_current_line_number($xml_parser);
+  }
+  else {
+       unset($xml_tree['parser_error']);
+       unset($xml_tree['parser_line']);
+  }
+  xml_parser_free($xml_parser);
+
+  $_end = microtime();
+
+  list($sec, $usec) = explode(' ', $_start);
+  $_start = $sec + $usec;
+  list($sec, $usec) = explode(' ', $_end);
+  $xml_tree['parser_time'] = ($sec + $usec) - $_start;
+
+  return $xml_tree;
+}
+
+/**
+ * Private call-back function used by the XML parser.
+ */
+function planet_element_start($parser, $name, $attributes) {
+  global $xml_tree, $xml_paths, $xml_path_cur;
+
+  $temp = &$xml_paths[$xml_path_cur++];
+  $temp[$name][] = $attributes;
+  $xml_paths[$xml_path_cur] = &$temp[$name][count($temp[$name])-1];
+}
+
+/**
+ * Private call-back function used by the XML parser.
+ */
+function planet_element_end($parser, $name) {
+  global $xml_tree, $xml_paths, $xml_path_cur;
+
+  $temp = &$xml_paths[$xml_path_cur];
+  array_pop($xml_paths);
+  $xml_path_cur--;
+  if (isset($temp['VALUE'])) {
+    $temp['VALUE'] = trim(planet_replace_entities($temp['VALUE']));
+  }
+}
+
+/**
+ * Private call-back function used by the XML parser.
+ */
+function planet_element_data($parser, $data) {
+  global $xml_tree, $xml_paths, $xml_path_cur;
+
+  $temp = trim($data);
+  if (strlen($temp) > 0) {
+    $temp = &$xml_paths[$xml_path_cur];
+    $temp['VALUE'] .= $data;
+  }
+}
+
+function planet_page_last() {
+  global $user;
+
+  $output = '<br />';
+
+  $result = pager_query(db_rewrite_sql("SELECT n.nid, n.created FROM {node} n WHERE n.type = 'planet' AND n.status = 1 ORDER BY n.created DESC"), variable_get('default_nodes_main', 10));
+
+  while ($node = db_fetch_object($result)) {
+    $node = node_load($node->nid);
+    $node->format = variable_get('planet_filter_formats', 1);
+    $output .= node_view($node);
+  }
+  $output .= theme('pager', NULL, variable_get('default_nodes_main', 10));
+  //$output .= theme('xml_icon', url('blog/feed'));
+  
+  drupal_add_link(array('rel' => 'alternate',
+                        'type' => 'application/rss+xml',
+                        'title' => t('RSS - blogs'),
+                        'href' => url("blog/feed")));
+
+  print theme('page', $output);
+}
+
+function planet_feed() {
+  $result = db_query_range(db_rewrite_sql("SELECT n.nid, n.title, n.body teaser, n.created, u.name, u.uid FROM {node} n INNER JOIN {users} u ON n.uid = u.uid WHERE n.type = 'planet' AND n.status = 1 ORDER BY n.created DESC"), 0, 15);
+  //$channel['title'] = variable_get('site_name', 'drupal') .' blogs';
+  $channel['title'] = 'Planet Blog';
+  $channel['link'] = url('planet', array('absolute' => TRUE));
+  $channel['description'] = 'Planet feed';
+  node_feed($result, $channel);
+}
+
+/**
+ * Implementation of hook_user().
+ */
+function planet_user($type, &$edit, &$user) {
+  if ($type == 'view' && user_access('edit own blog', $user)) {
+    $items[] = array('title' => t('Blog'),
+      'value' => /* TODO
+   Please manually fix the parameters on the l() or url() function on the next line.
+   Typically, this was not changed because of a function call inside an array call like
+   array('title' => t('View user profile.')).*/
+l(t('view recent blog entries'), "planet/$user->uid", array('title' => t("Read %username's latest blog entries.", array('%username' => $user->name)))),
+      'class' => 'blog',
+    );
+    return array(t('History') => $items);
+  }
+  if ($type == 'load') {
+    $obj = db_fetch_object(db_query('SELECT link FROM {planet_feeds} WHERE uid = %d', $user->uid));
+    $user->planet_feed = $obj->link;
+  }
+}
+
+/**
+ * Menu callback; displays a Drupal page containing recent planet entries.
+ */
+function planet_page($a = NULL, $b = NULL) {
+
+  if (is_numeric($a)) { // $a is a user ID
+    if ($b == 'feed') {
+      return planet_feed_user($a);
+    }
+    else {
+      return planet_page_user($a);
+    }
+  }
+  else if ($a == 'feed') {
+    return planet_feed_last();
+  }
+  else {
+    return planet_page_last();
+  }
+}
+
+function planet_page_user($uid) {
+  global $user;
+
+  $account = user_load(array((is_numeric($uid) ? 'uid' : 'name') => $uid, 'status' => 1));
+
+  if ($account->uid) {
+    drupal_set_title($title = t("%name's planet", array('%name' => $account->name)));
+
+    if ($output) {
+      $output = '<ul>'. $output .'</ul>';
+    }
+    else {
+      $output = '';
+    }
+     $result = pager_query(db_rewrite_sql("SELECT n.nid, n.sticky, n.created FROM {node} n WHERE type = 'planet' AND n.uid = %d AND n.status = 1 ORDER BY n.sticky DESC, n.created DESC"), variable_get('default_nodes_main', 10), 0, NULL, $account->uid);
+    while ($node = db_fetch_object($result)) {
+      $output .= node_view(node_load($node->nid), 1);
+    }
+    $output .= theme('pager', NULL, variable_get('default_nodes_main', 10));
+    $output .= theme('feed_icon', url("planet/$account->uid/feed"));
+
+    drupal_add_link(array('rel' => 'alternate',
+                          'type' => 'application/rss+xml',
+                          'title' => t('RSS - %title', array('%title' => $title)),
+                          'href' => url("planet/$account->uid/feed")));
+    return $output;
+  }
+  else {
+    drupal_not_found();
+  }
+}
+
+function planet_load($node) {
+  $additions = db_fetch_object(db_query('SELECT link, guid FROM {planet_items} WHERE nid = %d', $node->nid));
+  return $additions;
+}
+
+function planet_form(&$node, &$param) {
+  $form = array();
+  $form['title'] = array('#type' => 'textfield', '#title' => 'Title', '#value' => $node->title, '#size' => 30, '#maxlength' => 80);
+  $form['body'] = array('#type' => 'textarea', '#title' => 'Body', '#value' => $node->body);
+  return $form;
+}
+

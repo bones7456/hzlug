@@ -1,0 +1,6 @@
+; $Id: planet.info,v 1.2 2007/05/30 03:22:01 daryl Exp $
+name = Planet
+description = Planet blog aggregator
+package = Community - optional
+version = 6.x
+core = 6.x
