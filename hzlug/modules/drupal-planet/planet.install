@@ -1,0 +1,181 @@
+<?php
+// $Id: planet.install Exp $
+
+/**
+ * Implementation of hook_schema().
+ */
+
+function planet_schema() {
+  $schema['planet_feeds'] = array(    
+    'description' => t('The base table for planet.'),
+    'fields' => array(
+      'fid' => array(
+        'description' => t('The primary identifier for a planet_feeds table.'),  
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'uid' => array(        
+        'type' => 'int',
+        'unsigned' => 1,
+        'not null' => FALSE,
+      ),
+      'title' => array(        
+        'type' => 'varchar',
+        'length' => 50,
+        'not null' => TRUE,
+      ),
+      'link' => array(        
+        'type' => 'varchar',
+        'length' => 80,
+        'not null' => TRUE,
+      ),
+      'image' => array(
+        'type' => 'varchar',
+        'length' => 120,
+        'not null' => FALSE,
+      ),
+      'checked' => array(        
+        'type' => 'int',
+        'not null' => FALSE,
+      ),
+      'frozen' => array(        
+        'type' => 'int',        
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'hash' => array(
+        'type' => 'varchar',
+        'length' => 32,
+        'description' => t("A hash of the feed's headers."),
+      ),
+      'error' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'length' => 1,
+        'description' => t("Whether the feed is throwing errors or not."),
+      ), 
+    ),
+    'primary key' => array('fid'),
+    'indexes' => array(
+      'error' => array('error'),
+    ),
+  );
+
+  $schema['planet_items'] = array(
+    'description' => t('contain feed id and its corresponding nid'),
+    'fields' => array(
+      'id' => array(
+        'description' => t('The primary identifier for a planet_items table'),
+        'type' => 'serial',
+        'unsigned' => 1,
+        'not null' => TRUE,
+      ),
+      'fid' => array(
+        'type' => 'int',
+        'unsigned' => 1,
+        'not null' => FALSE,
+      ),
+      'nid' => array(
+        'type' => 'int',
+        'unsigned' => 1,
+        'not null' => FALSE,
+      ),
+      'iid' => array(
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'description' => t("md5 of the feed item's title and body."),
+      ),
+      'guid' => array(
+        'type' => 'varchar',
+        'length' => 120,
+        'not null' => FALSE,
+      ),
+      'link' => array(
+        'type' => 'varchar',
+        'length' => 180,
+        'not null' => FALSE,
+      ),
+      'created' => array(        
+        'type' => 'int',
+        'not null' => FALSE,
+      ),
+    ),
+    'primary key' => array('id'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implementation of hook_install()
+ *
+ * This will automatically install the database tables for the planet module for MySQL.
+ *
+ * If you are using another database, you will have to install the tables by hand, using the queries below as a reference.
+ *
+ * 
+ */
+
+function planet_install() {
+  // Create tables.
+  drupal_install_schema('planet');
+}
+
+/**
+ * Implementation of hook_uninstall()
+ *
+ * This will automatically uninstall the database tables for the planet module for MySQL.
+ * 
+ *  
+ */
+
+function planet_uninstall() {
+  variable_del('planet_redirect_page');
+  variable_del('planet_filter_formats');
+  variable_del('planet_author_roles');
+  cache_clear_all('planet:', 'cache', true); 
+  drupal_uninstall_schema('planet');
+  db_query("DELETE FROM {node} WHERE type = '%s'", planet);
+  
+}
+
+function planet_update_1() {
+  $ret = array();
+  db_add_field($ret, 'planet_feeds', 'hash', array(
+        'type' => 'varchar',
+        'length' => 32,
+        'description' => t("A hash of the feed's headers."),
+      )
+    );
+  return $ret;
+}
+
+function planet_update_2() {
+  $ret = array();
+  db_add_field($ret, 'planet_items', 'iid', array(
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'description' => t("md5 of the feed item's title and body."),
+      )
+    );
+  return $ret;
+}
+
+function planet_update_3() {
+  $ret = array();
+  db_add_field($ret, 'planet_feeds', 'error', array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'length' => 1,
+        'description' => t("Whether the feed is throwing errors or not."),
+      )
+    );
+  db_add_index($ret, 'planet_feeds', 'error', array('error'));
+  
+  return $ret;  
+}
