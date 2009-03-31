@@ -1,0 +1,47 @@
+@charset "utf-8";
+/* $Id: fix-ie.css,v 1.1.2.23 2008/07/27 18:05:04 andregriffin Exp $ */
+
+.thmr_call {
+  width:100%;
+  text-align:center;
+}
+
+.thmr_call .thmr_call {
+  width:auto;
+  text-align:left;
+}
+
+.thmr_call #wrapper {
+  text-align:left;
+}
+
+div#bg-top {
+  margin-top: -4px;
+}
+
+#header{
+  padding-top: 15px;
+}
+
+#bg-top {
+  padding-top: -10px;
+}
+
+#topNav {
+  top: -20px;
+}
+
+span.corners-top, span.corners-top span, span.corners-bottom, span.corners-bottom span {
+  background: none;
+}
+
+#bg-left, #bg-right {
+  behavior: url(<?php global $base_path; print $base_path.path_to_theme(); ?>/iepatches/iepngfix.php?path=<?php global $base_path; print $base_path.path_to_theme(); ?>);
+  top: -4px;
+}
+
+#iebanner {
+  width: 100%;
+  background: #ffffcc;
+  text-align: center;
+}
